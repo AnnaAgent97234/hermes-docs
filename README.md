@@ -24,8 +24,9 @@ This guide is a working recipe, not marketing copy. It documents a reference dep
 5. [Optimizations & pro-tips](#optimizations--pro-tips)
 6. [Safety & maintenance](#safety--maintenance)
 7. [Troubleshooting](#troubleshooting)
-8. [Repository structure](#repository-structure)
-9. [Sources](#sources)
+8. [Shipped code: `ollama_agent_client.py`](#shipped-code-ollama_agent_clientpy)
+9. [Repository structure](#repository-structure)
+10. [Sources](#sources)
 
 ---
 
@@ -370,6 +371,45 @@ hermes gateway status        # or: pgrep -af "gateway run"
 | Model loads correctly but is slow on first call | First-token delay | Normal for a first call (Ollama cold-loads the model). Subsequent calls are fast. If *every* call is slow, the model is on the CPU path — check the GPU driver/ROCm path. |
 
 When in doubt, read the config back with `hermes config get <key>` and compare against the reference values in [3.3](#33-wire-the-local-provider-into-configyaml) — most "mystery" behaviour in this stack is a single wrong `base_url` or a model the config references that was never pulled.
+
+## Shipped code: `ollama_agent_client.py`
+
+`code/ollama_agent_client.py` is a single-file Python client for talking to a local Ollama server that does the context management *right* rather than leaving it to Ollama's defaults. It is written against the reference deployment above (targeting `qwen3.8:27b` on a GPU that mostly holds weights, not context) and has exactly one runtime dependency: `requests`.
+
+What it handles, and why each matters on a local box:
+
+1. **Explicit context budgeting.** Instead of trusting Ollama's VRAM-tier auto-sizing (which ignores how much of your VRAM the weights already occupy), it takes a `num_ctx` you set, computes a safe `num_predict` from what's left, and holds a `safety_margin` for formatting and tokenizer error. It then verifies against reality via `/api/ps` and logs a loud warning if the server quietly clamped the context smaller than you asked — the most common silent failure on an under-provisioned card.
+2. **Sliding-window history.** Each call keeps only the most recent messages that fit the budget. Older messages are not lost silently: an optional `summarizer` callable compresses them into a running `[Summary of earlier conversation]`, or a compact truncated note is written as a fallback, so continuity survives the trim.
+3. **Truncation recovery.** If the model hits the length limit mid-answer (`done_reason == "length"`), it detects it, appends a "continue exactly where you left off" turn, recomputes the budget against the now-larger prompt, and retries — up to `max_continuations` rounds — before reporting that the reply may still be incomplete.
+4. **Usage accounting.** Every call records estimated prompt tokens, the `num_predict` used, the `done_reason`, and the continuation count. `print_usage_summary()` gives you a roll-up so you can see where the token budget actually goes.
+
+Two more levers it exposes for the thinking-capable models in this stack:
+
+- **`think`** — set per-client or per-call. Reasoning tokens count against `num_predict` just like the visible answer, so leaving thinking off for routine/tool turns frees real output budget and is the difference between a truncated and a complete reply.
+- **`keep_alive`** — how long Ollama keeps the model resident after a call. Reloading an ~17–18 GB model from disk between agent turns is expensive; a `30m` window keeps it warm across a session.
+
+Minimal usage:
+
+```python
+from ollama_agent_client import OllamaAgentClient
+
+client = OllamaAgentClient(
+    model="qwen3.8:27b",
+    base_url="http://localhost:11434",
+    num_ctx=32768,          # set explicitly — don't rely on auto-sizing
+    keep_alive="30m",       # keep the big model resident between turns
+    think=False,            # flip to "low"/True only when you need reasoning
+    system_prompt="You are a concise, technically precise assistant.",
+)
+
+reply = client.chat("Explain the TCP three-way handshake, including edge cases.")
+print(reply)
+client.print_usage_summary()
+```
+
+**Before you run it**, start `ollama serve` with `OLLAMA_FLASH_ATTENTION=1 OLLAMA_KV_CACHE_TYPE=q8_0` to roughly halve KV-cache memory, and check `ollama ps` for a 100% GPU `PROCESSOR` split at your chosen `num_ctx`. The module's `__main__` block is a working starting point tuned for a 24 GiB VRAM / 48 GiB RAM host — adjust `num_ctx` to what `ollama ps` actually reports for your card. The default token counter is a heuristic budgeting aid (roughly 4 chars/token); call `client.set_tokenizer(...)` with a real tokenizer for precise accounting.
+
+The full interface and tunables live in the module's docstrings — `OLLAMA_*` environment variables are server-level (set when starting `ollama serve`), while `num_ctx`, `think`, and `keep_alive` are per-request.
 
 ## Repository structure
 
