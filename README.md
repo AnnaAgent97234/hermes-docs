@@ -10,7 +10,7 @@ This guide is a working recipe, not marketing copy. It documents a reference dep
 
 ## In this guide
 
-1. [Prerequisites & Bill of Materials](#prerequisites--bill-of-materials)
+1. [Prerequisites](#prerequisites)
 2. [Reference host spec](#reference-host-spec)
 3. [Setup — step by step](#setup--step-by-step)
    - [3.1 Install Ollama and pull the models](#31-install-ollama-and-pull-the-models)
@@ -24,22 +24,14 @@ This guide is a working recipe, not marketing copy. It documents a reference dep
 5. [Optimizations & pro-tips](#optimizations--pro-tips)
 6. [Safety & maintenance](#safety--maintenance)
 7. [Troubleshooting](#troubleshooting)
-8. [Shipped code: `ollama_agent_client.py`](#shipped-code-ollama_agent_clientpy)
-9. [Repository structure](#repository-structure)
-10. [Sources](#sources)
+8. [`~/.hermes` layout](#-hermes-layout)
+9. [Sources](#sources)
 
 ---
 
-## Prerequisites & Bill of Materials
+## Prerequisites
 
-Before you start, make sure every item below is true. This is the shortest path to a working stack — do not skip the disk check.
-
-### Hardware
-
-- [ ] A 64-bit x86-64 machine with **at least 46 GiB of RAM** (the 27 B and 30 B class models both want to live in system memory on this GPU-free path).
-- [ ] **At least 1.3 TiB of NVMe**, with roughly **580 GiB free** at install time — `qwen3.8:27b` is ~17 GB, `qwen3-coder:30b` is ~18 GB, and you want headroom for `gemma4:31b` and `devstral-small-2:24b` if you enable them.
-- [ ] An **AMD GPU in the RX 7900 class (Navi 31)** or a discrete card with AMDGPU/ROCm drivers present. On an AMD iGPU-only box the 27 B/30 B path still works, slower; the GPU is what keeps the 30 B class responsive.
-- [ ] A **sustained network link** for the initial model pulls and the `ollama pull` resume logic. After pulls, the model calls are loopback, not the internet.
+Before you start, make sure every item below is true.
 
 ### Software & accounts
 
@@ -372,62 +364,17 @@ hermes gateway status        # or: pgrep -af "gateway run"
 
 When in doubt, read the config back with `hermes config get <key>` and compare against the reference values in [3.3](#33-wire-the-local-provider-into-configyaml) — most "mystery" behaviour in this stack is a single wrong `base_url` or a model the config references that was never pulled.
 
-## Shipped code: `ollama_agent_client.py`
+## `~/.hermes` layout
 
-`code/ollama_agent_client.py` is a single-file Python client for talking to a local Ollama server that does the context management *right* rather than leaving it to Ollama's defaults. It is written against the reference deployment above (targeting `qwen3.8:27b` on a GPU that mostly holds weights, not context) and has exactly one runtime dependency: `requests`.
+The deployment's persistent state all lives under `~/.hermes/`. The five pieces worth knowing:
 
-What it handles, and why each matters on a local box:
+- **`SOUL.md`** — the agent's identity: who it is, how it talks, the boundaries it keeps. Load-bearing for tone and behaviour, not for facts.
+- **`skills/`** — the library of procedural operating manuals (Markdown + frontmatter), loaded only when a task matches. Self-maintained by the curator; see [3.4](#34-memory-skills-and-the-curator).
+- **`hermes-agent/`** — the runtime home, carrying its own `SOUL.md`, `skills/`, and the memory store: `USER.md` (operator profile, char-limited) and `MEMORY.md` (agent's own notes, char-limited).
+- **`tools/`** — the runtimes and binaries the agent uses, installed version-pinned: Python, Node, ffmpeg, a bundled browser, ripgrep, an agent-browser, and more. Add or remove via `hermes tools`, not by hand.
+- **`vault/`** — the encrypted secrets store. Credentials live here, never in `config.yaml` or memory files (which are meant to be shared).
 
-1. **Explicit context budgeting.** Instead of trusting Ollama's VRAM-tier auto-sizing (which ignores how much of your VRAM the weights already occupy), it takes a `num_ctx` you set, computes a safe `num_predict` from what's left, and holds a `safety_margin` for formatting and tokenizer error. It then verifies against reality via `/api/ps` and logs a loud warning if the server quietly clamped the context smaller than you asked — the most common silent failure on an under-provisioned card.
-2. **Sliding-window history.** Each call keeps only the most recent messages that fit the budget. Older messages are not lost silently: an optional `summarizer` callable compresses them into a running `[Summary of earlier conversation]`, or a compact truncated note is written as a fallback, so continuity survives the trim.
-3. **Truncation recovery.** If the model hits the length limit mid-answer (`done_reason == "length"`), it detects it, appends a "continue exactly where you left off" turn, recomputes the budget against the now-larger prompt, and retries — up to `max_continuations` rounds — before reporting that the reply may still be incomplete.
-4. **Usage accounting.** Every call records estimated prompt tokens, the `num_predict` used, the `done_reason`, and the continuation count. `print_usage_summary()` gives you a roll-up so you can see where the token budget actually goes.
-
-Two more levers it exposes for the thinking-capable models in this stack:
-
-- **`think`** — set per-client or per-call. Reasoning tokens count against `num_predict` just like the visible answer, so leaving thinking off for routine/tool turns frees real output budget and is the difference between a truncated and a complete reply.
-- **`keep_alive`** — how long Ollama keeps the model resident after a call. Reloading an ~17–18 GB model from disk between agent turns is expensive; a `30m` window keeps it warm across a session.
-
-Minimal usage:
-
-```python
-from ollama_agent_client import OllamaAgentClient
-
-client = OllamaAgentClient(
-    model="qwen3.8:27b",
-    base_url="http://localhost:11434",
-    num_ctx=32768,          # set explicitly — don't rely on auto-sizing
-    keep_alive="30m",       # keep the big model resident between turns
-    think=False,            # flip to "low"/True only when you need reasoning
-    system_prompt="You are a concise, technically precise assistant.",
-)
-
-reply = client.chat("Explain the TCP three-way handshake, including edge cases.")
-print(reply)
-client.print_usage_summary()
-```
-
-**Before you run it**, start `ollama serve` with `OLLAMA_FLASH_ATTENTION=1 OLLAMA_KV_CACHE_TYPE=q8_0` to roughly halve KV-cache memory, and check `ollama ps` for a 100% GPU `PROCESSOR` split at your chosen `num_ctx`. The module's `__main__` block is a working starting point tuned for a 24 GiB VRAM / 48 GiB RAM host — adjust `num_ctx` to what `ollama ps` actually reports for your card. The default token counter is a heuristic budgeting aid (roughly 4 chars/token); call `client.set_tokenizer(...)` with a real tokenizer for precise accounting.
-
-The full interface and tunables live in the module's docstrings — `OLLAMA_*` environment variables are server-level (set when starting `ollama serve`), while `num_ctx`, `think`, and `keep_alive` are per-request.
-
-## Repository structure
-
-If you put this deployment in a repo, this is a sane layout. Keep it small — the whole point is that the entire thing is one config file plus two memory files plus a skill library.
-
-```
-hermes-docs/
-├── README.md                     # this guide
-├── config/
-│   └── config.example.yaml       # sanitized copy of ~/.hermes/config.yaml (sentinel keys only)
-├── notes/
-│   ├── MEMORY.example.md         # template, NOT your real MEMORY.md
-│   └── USER.example.md           # template, NOT your real USER.md
-└── skills/                        # only the custom skills worth sharing
-    └── ...
-```
-
-Two rules for what goes in the repo. First, **no live secrets** — the config that ships has the `ollama` sentinel, never a real provider key. Second, **no identity** — the example memory files are templates describing *what to put there*, not the operator's actual profile.
+The rest of the state — `config.yaml`, `memories/`, `sessions/`, `cron/`, `kanban.db`, gateway state, logs — is operational, and covered in the sections above.
 
 ## Sources
 
