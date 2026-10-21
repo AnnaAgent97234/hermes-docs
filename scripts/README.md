@@ -2,56 +2,104 @@
 
 Helper code for this deployment. One file:
 
-- **`ollama_agent_client.py`** — a single-file Python client for a local Ollama server (only dependency: `requests`) that manages context explicitly instead of trusting Ollama's defaults.
+- **`llama_agent_client.py`** — a single-file Python 3 client for the local
+  llama-swap proxy (OpenAI-compatible `/v1` API). Standard library only, no
+  third-party dependencies.
 
 ## Why it exists
 
-Ollama auto-picks context size by total VRAM — under 24 GiB → 4k, 24–48 GiB → 32k, 48 GiB+ → 256k. That arithmetic is wrong here: the reference model's weights alone occupy nearly the whole 24 GiB card, leaving only a few GiB for KV cache. So auto-sizing silently undershoots, and the client takes `num_ctx` from you instead of guessing.
+A one-liner chat client for a single agent-style turn against the live local
+LLM stack. It exists so you can send a prompt from the terminal (or a shell
+script) without reaching for `curl` + `jq` or an HTTP library:
 
-It also handles the three failure modes that actually bite in an agent loop:
+- The model name, base URL, system prompt and temperature are all
+  configurable from the command line.
+- The reply is **streamed** token-by-token by default (`--no-stream` disables
+  it), so you see the answer as it is generated instead of waiting for a
+  single JSON blob at the end.
+- The two failure modes that actually bite here produce clear, actionable
+  error messages:
+  - **Connection refused** → the `llama-swap` systemd user service is not
+    running (the proxy is what the script talks to).
+  - **HTTP 404** → the model alias is missing from llama-swap (you asked for
+    a model that the proxy does not know about).
 
-- **Truncation.** If a reply hits the output limit (`done_reason == "length"`), it appends a "continue exactly where you left off" turn and retries — up to `max_continuations` rounds.
-- **Unbounded output.** `num_predict` is computed from the tokens actually left after the prompt, not a fixed constant.
-- **Context creep.** A sliding window keeps only recent turns within budget; older turns are compressed into a running summary by an optional `summarizer` callable.
+## Prerequisites
 
-## Tunables that matter here
+- `python3` on your `PATH` (any 3.x; only the standard library is used).
+- The `llama-swap` systemd **user** service running, listening on
+  `127.0.0.1:8080`:
 
-| Knob | Default | What it does |
-|---|---|---|
-| `num_ctx` | `32768` | Total context window (input + output). Start at 32k on the reference card with the 27 B model and step up only while watching `ollama ps`. |
-| `min_output` / `max_output` | `512` / `4096` | Floor and ceiling for the computed `num_predict`. |
-| `max_continuations` | `3` | Retry rounds on `done_reason == "length"`. |
-| `think` | `False` | Per-call reasoning budget. Off is correct for ordinary agent turns — reasoning tokens otherwise eat the output budget and you hit `length` on the real answer. |
-| `keep_alive` | `None` (Ollama default) | How long Ollama keeps the model resident. Set e.g. `"30m"` to avoid re-reading an ~18 GB model from disk between turns. |
+  ```bash
+  systemctl --user status llama-swap
+  # expected: active (running), ExecStart=/usr/bin/llama-swap --config ...
+  # --listen 127.0.0.1:8080
+  ```
 
-## Two things to do before you trust it
+- A model alias registered in llama-swap. The two known on this box are
+  `qwen3.8:27b` (default) and `qwen3-coder:30b`.
 
-1. **Restart `ollama serve` with two env vars set** (they are per-server, not per-request):
+## Run it
 
-   ```bash
-   OLLAMA_FLASH_ATTENTION=1 OLLAMA_KV_CACHE_TYPE=q8_0 ollama serve
-   ```
+```bash
+# Default model (qwen3.8:27b), streaming reply:
+python3 scripts/llama_agent_client.py "Explain the TCP three-way handshake."
 
-   Together they roughly halve KV-cache memory — the difference between staying on-GPU and spilling silently into system RAM (much slower).
+# Pick a different model:
+python3 scripts/llama_agent_client.py --model qwen3-coder:30b "Write a parser."
 
-2. **After loading the model, check `ollama ps`** — the `PROCESSOR` column must read `100% GPU`. If context is spilling to CPU, step `num_ctx` down (e.g. 16384) before touching anything else. The client's own `/api/ps` check will confirm what Ollama actually loaded versus what you asked for.
+# Custom system prompt and temperature:
+python3 scripts/llama_agent_client.py --system "You are terse." \
+    --temperature 0.2 "ping"
 
-## Minimal usage
-
-```python
-from ollama_agent_client import OllamaAgentClient
-
-client = OllamaAgentClient(
-    model="qwen3.8:27b",
-    base_url="http://localhost:11434",
-    num_ctx=32768,
-    keep_alive="30m",
-    system_prompt="You are a concise, technically precise assistant.",
-)
-
-reply = client.chat("Explain the TCP three-way handshake, including edge cases.")
-print(reply)
-client.print_usage_summary()
+# Non-streaming (single JSON-style blob printed at the end):
+python3 scripts/llama_agent_client.py --no-stream "ping"
 ```
 
-The default token counter is a heuristic (~4 chars/token). For precise budgeting, call `client.set_tokenizer(...)` with a real tokenizer for your model.
+The first request after the model has been unloaded can take a while — the
+proxy spawns a `llama-server` and reads the model weights from disk before it
+can start generating. Subsequent requests while the model is resident (its
+idle TTL is 600 s) are fast.
+
+## Flags
+
+| Flag | Default | What it does |
+|---|---|---|
+| `--model` | `qwen3.8:27b` | Model name to request. `qwen3-coder:30b` is the other known alias. |
+| `--base-url` | `http://127.0.0.1:8080/v1` | Base URL of the OpenAI-compatible API. Overridden by `--base-url` and by the `LLAMA_SWAP_BASE_URL` env var (flag wins). |
+| `--system` | `"You are a concise, technically precise assistant."` | System prompt prepended to the user message. |
+| `--temperature` | *(unset)* | Sampling temperature. Omit to let the server/model default apply. |
+| `--no-stream` | off | Disable token streaming; print the full reply once. |
+
+## What changed
+
+This script used to talk to **Ollama** at `http://127.0.0.1:11434/api/chat`.
+Ollama has been replaced by **llama-swap** on `http://127.0.0.1:8080/v1`,
+which speaks the OpenAI-compatible chat-completions API. So the request is
+now `POST /v1/chat/completions` with `{"model", "messages", "stream", ...}`
+instead of Ollama's `options`-flavoured body, and the `Authorization` header
+carries a placeholder key (`local`) that llama-swap ignores.
+
+The equivalent raw `curl` against the proxy:
+
+```bash
+curl -sS http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer local' \
+  -d '{
+        "model": "qwen3.8:27b",
+        "messages": [
+          {"role": "user", "content": "Reply with exactly: OK"}
+        ],
+        "stream": false
+      }'
+```
+
+## Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| `cannot reach the proxy at http://127.0.0.1:8080/v1: [Errno 111] Connection refused` | `systemctl --user status llama-swap` — if it is not `active (running)`, `systemctl --user start llama-swap`. |
+| `HTTP 404 — model '...' is not available.` | `curl -s http://127.0.0.1:8080/v1/models` to list the aliases llama-swap actually knows. |
+| First request is slow (tens of seconds) | Expected — the proxy is spawning `llama-server` and loading the model. |
+| `stream` reply looks garbled in a pipe | Pipe to `cat` or disable `--no-stream`; some terminals mangle incremental output. |
