@@ -35,19 +35,19 @@ This guide is a working recipe, not marketing copy. It documents a reference dep
 10. [Sources](#sources)
 
 ---
-## Prerequisites
+### Prerequisites
 
 Before you start, make sure every item below is true.
 
-### Software & accounts
+#### Software & accounts
 
 - [ ] A Linux distro you can build llama.cpp on. Reference: **CachyOS**.
 - [ ] A C/C++ toolchain (GCC, CMake) for building `llama-server` from source — or a package that ships it.
-- [ ] An AMD GPU in the RX 7900 class (or equivalent) with a working ROCm/AMDGPU path, if you want 27 B–30 B models at usable speed.
+- [ ] An AMD GPU in the RX 7900 class (or equivalent) with a working ROCm/AMDGPU path (Vulkan backend), if you want 27 B–30 B models at usable speed.
 - [ ] Outbound HTTPS (for downloads on first setup).
 - [ ] No API keys, no cloud accounts. The whole point is that there is nothing to sign in to.
 
-### Expected state when you're done
+#### Expected state when you're done
 
 You can run `hermes` from a shell and it answers using a model that is already on disk. `curl http://127.0.0.1:8080/v1/models` lists the models, and the active one is serving on the GPU. Killing network access to the outside world does not change any of that.
 
@@ -455,12 +455,13 @@ hermes gateway status        # or: pgrep -af "gateway run"
 
 - **Let TTL do the co-residence for you.** One GPU, two big models: llama-swap's `ttl: 600` means each lane pays a one-time cold load (a few seconds of weight loading) and then serves fast. Do not raise TTL to "avoid cold loads" unless you have measured real pain — VRAM headroom for the desktop is worth more.
 - **`-ngl 99` + q8_0 KV + flash-attn is the sweet spot.** Weights on GPU, 8-bit KV cache, flash attention: 64 k context on RX 7900-class VRAM. Dropping to f16 KV roughly doubles KV memory and is only worth it if you see quality regressions at 64 k, which is rare.
-- **Keep the delegation lane on the coder model.** The split — chat on `qwen3.8:27b`, sub-agents on `qwen3-coder:30b` — is the economic core of this stack. Re-merging them onto one resident model wastes the GPU's most scarce resource (VRAM) and buys nothing.
+- **Keep the delegation lane on the coder model.** The split — chat on `qwen3-coder:30b`, sub-agents on `qwen3.8:27b` — is the economic core of this stack. Re-merging them onto one resident model wastes the GPU's most scarce resource (VRAM) and buys nothing.
 - **`max_iterations: 60` / `child_timeout_seconds: 600` are cheap insurance.** A sub-agent pinned by either bound reports `timed_out` instead of wedging the parent. Raise them only for a lane you have measured to be slow, and measure again.
 - **One concurrent sub-agent, one spawn depth.** `max_concurrent_children: 1` and `max_spawn_depth: 1` keep a single machine from multiplexing model load. Fan out only when you have real headroom.
 - **The curator's `keep: 5` backup is your undo.** Before a manual curation pass you did not ask for, snapshot the skill dir yourself; after the pass, verify the archive did not take a live skill.
 - **`api_key: local` / `api_key: ollama` are sentinels, not credentials.** Do not paste a real secret into the local provider block — llama-swap ignores it and you would be leaking a real key into an insecure config.
 - **Point cron `deliver` at a real channel.** A job with no `deliver` runs and stores output but reaches no one. `telegram`/`origin` is the difference between a job that works and a job that works *and tells you it worked*.
+- **ROCm/Vulkan backend.** The system uses ROCm with Vulkan for GPU acceleration, which provides optimal performance for AMD GPUs in this configuration.
 
 ## Safety & maintenance
 
