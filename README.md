@@ -35,19 +35,19 @@ This guide is a working recipe, not marketing copy. It documents a reference dep
 10. [Sources](#sources)
 
 ---
-## Prerequisites
+### Prerequisites
 
 Before you start, make sure every item below is true.
 
-### Software & accounts
+#### Software & accounts
 
 - [ ] A Linux distro you can build llama.cpp on. Reference: **CachyOS**.
 - [ ] A C/C++ toolchain (GCC, CMake) for building `llama-server` from source — or a package that ships it.
-- [ ] An AMD GPU in the RX 7900 class (or equivalent) with a working ROCm/AMDGPU path, if you want 27 B–30 B models at usable speed.
+- [ ] An AMD GPU in the RX 7900 class (or equivalent) with a working ROCm/AMDGPU path (Vulkan backend), if you want 27 B–30 B models at usable speed.
 - [ ] Outbound HTTPS (for downloads on first setup).
 - [ ] No API keys, no cloud accounts. The whole point is that there is nothing to sign in to.
 
-### Expected state when you're done
+#### Expected state when you're done
 
 You can run `hermes` from a shell and it answers using a model that is already on disk. `curl http://127.0.0.1:8080/v1/models` lists the models, and the active one is serving on the GPU. Killing network access to the outside world does not change any of that.
 
@@ -68,7 +68,7 @@ These are the values from the system this guide reproduces. Treat them as the *f
 | Runtime 1 | llama.cpp `llama-server` (0.6.0-dev, build 11429), one process per model, all layers on GPU |
 | Runtime 2 | llama-swap v265 (model router), listening on `127.0.0.1:8080` |
 | Runtime 3 | Hermes Agent v0.22.2 (Python 3.14) |
-| Models in use | `qwen3.8:27b` (default, 16.8 GiB GGUF), `qwen3-coder:30b` (delegation, 18.6 GiB GGUF) |
+| Models in use | `qwen3-coder:30b` (default, 18.6 GiB GGUF), `qwen3.8:27b` (delegation, 16.8 GiB GGUF) |
 | Context | 65 536 tokens per model, q8_0 KV cache, flash attention |
 | Timezone | `Europe/Paris` |
 
@@ -112,8 +112,8 @@ llama.cpp speaks GGUF, so the models must be GGUF files on disk. The reference s
 
 | File | Size | Role |
 |---|---|---|
-| `qwen3.8-27b.gguf` | 16.8 GiB | Default model — chat, reasoning, compression, session titles |
-| `qwen3-coder-30b.gguf` | 18.6 GiB | Sub-agent delegation lane |
+| `qwen3-coder-30b.gguf` | 18.6 GiB | Default model — chat, reasoning, compression, session titles |
+| `qwen3.8-27b.gguf` | 16.8 GiB | Sub-agent delegation lane |
 | `qwen3.8-27b.mmproj.gguf` | 0.9 GiB | Multimodal projector for `qwen3.8:27b` (not loaded by the reference router) |
 
 On the reference machine these were **migrated from the old Ollama store**, not re-downloaded: the conversion helpers are kept next to the models as provenance (`extract-ollama-model.sh`, `convert-ollama-models.sh` in `~/Dev/llm/`). If you are starting fresh, obtain the GGUF files from the model's release channel and place them where `llama-swap.yaml` points at them.
@@ -238,7 +238,7 @@ The reference slice of `config.yaml` that makes the whole thing run 100% locally
 
 ```yaml
 model:
-  default: qwen3.8:27b
+  default: qwen3-coder:30b
   base_url: 'http://127.0.0.1:8080/v1'
   provider: local-llama-swap
   max_tokens: 4096
@@ -250,18 +250,18 @@ providers:
     name: Local (llama-swap)
     api: http://127.0.0.1:8080/v1
     api_key: local
-    default_model: qwen3.8:27b
+    default_model: qwen3-coder:30b
     models:
-      - qwen3.8:27b
       - qwen3-coder:30b
+      - qwen3.8:27b
 
 auxiliary:
   compression:                # session-history compression
-    model: qwen3.8:27b
+    model: qwen3-coder:30b
     base_url: http://127.0.0.1:8080/v1
     api_key: ollama           # legacy sentinel from the Ollama era — still an inert string
   title:                      # session auto-titling
-    model: qwen3.8:27b
+    model: qwen3-coder:30b
     base_url: http://127.0.0.1:8080/v1
     api_key: ollama
 ```
@@ -455,12 +455,13 @@ hermes gateway status        # or: pgrep -af "gateway run"
 
 - **Let TTL do the co-residence for you.** One GPU, two big models: llama-swap's `ttl: 600` means each lane pays a one-time cold load (a few seconds of weight loading) and then serves fast. Do not raise TTL to "avoid cold loads" unless you have measured real pain — VRAM headroom for the desktop is worth more.
 - **`-ngl 99` + q8_0 KV + flash-attn is the sweet spot.** Weights on GPU, 8-bit KV cache, flash attention: 64 k context on RX 7900-class VRAM. Dropping to f16 KV roughly doubles KV memory and is only worth it if you see quality regressions at 64 k, which is rare.
-- **Keep the delegation lane on the coder model.** The split — chat on `qwen3.8:27b`, sub-agents on `qwen3-coder:30b` — is the economic core of this stack. Re-merging them onto one resident model wastes the GPU's most scarce resource (VRAM) and buys nothing.
+- **Keep the delegation lane on the coder model.** The split — chat on `qwen3-coder:30b`, sub-agents on `qwen3.8:27b` — is the economic core of this stack. Re-merging them onto one resident model wastes the GPU's most scarce resource (VRAM) and buys nothing.
 - **`max_iterations: 60` / `child_timeout_seconds: 600` are cheap insurance.** A sub-agent pinned by either bound reports `timed_out` instead of wedging the parent. Raise them only for a lane you have measured to be slow, and measure again.
 - **One concurrent sub-agent, one spawn depth.** `max_concurrent_children: 1` and `max_spawn_depth: 1` keep a single machine from multiplexing model load. Fan out only when you have real headroom.
 - **The curator's `keep: 5` backup is your undo.** Before a manual curation pass you did not ask for, snapshot the skill dir yourself; after the pass, verify the archive did not take a live skill.
 - **`api_key: local` / `api_key: ollama` are sentinels, not credentials.** Do not paste a real secret into the local provider block — llama-swap ignores it and you would be leaking a real key into an insecure config.
 - **Point cron `deliver` at a real channel.** A job with no `deliver` runs and stores output but reaches no one. `telegram`/`origin` is the difference between a job that works and a job that works *and tells you it worked*.
+- **ROCm/Vulkan backend.** The system uses ROCm with Vulkan for GPU acceleration, which provides optimal performance for AMD GPUs in this configuration.
 
 ## Safety & maintenance
 
@@ -485,7 +486,7 @@ hermes gateway status        # or: pgrep -af "gateway run"
 The router is down. Check `systemctl --user status llama-swap`, then `journalctl --user -u llama-swap -n 40`. Common causes: a bad path in `--config`, a model file that moved under `~/Dev/llm/models/`, or a YAML syntax error in `llama-swap.yaml`. Fix, then `systemctl --user restart llama-swap`.
 
 **Symptom: Hermes says "provider not found" or "model not found".**
-The `providers.local-llama-swap` block and the `model` block disagree. `hermes config get model.default`, `hermes config get model.base_url`, and `hermes config get model.provider` should read `qwen3.8:27b`, `http://127.0.0.1:8080/v1`, `local-llama-swap`. If `provider` is empty, the provider block is missing or mis-named; if the model name is not in the `models:` list of that block, add it. Names must match llama-swap's `name:` or one of its `aliases:` exactly.
+The `providers.local-llama-swap` block and the `model` block disagree. `hermes config get model.default`, `hermes config get model.base_url`, and `hermes config get model.provider` should read `qwen3-coder:30b`, `http://127.0.0.1:8080/v1`, `local-llama-swap`. If `provider` is empty, the provider block is missing or mis-named; if the model name is not in the `models:` list of that block, add it. Names must match llama-swap's `name:` or one of its `aliases:` exactly.
 
 **Symptom: first response is slow (10–60 s), then fast.**
 That is the TTL unload in action — the model was offloaded and is cold-loading (weights + KV). Verify by watching `/v1/models` show `"status": "unloaded"` before the call. If you want to *avoid* cold loads, that is a design decision: keep TTL low and accept the load, or keep the model pinned at the cost of permanent VRAM. On this box, accept the load.
@@ -544,18 +545,18 @@ A minimal, zero-dependency (Python stdlib only) OpenAI-compatible client for the
 
 ```bash
 # one-shot completion on the default model
-python3 scripts/llama_agent_client.py --model qwen3.8:27b "Reply with exactly one word: OK"
+python3 scripts/llama_agent_client.py --model qwen3-coder:30b "Reply with exactly one word: OK"
 
 # pick the delegation-lane model explicitly
-python3 scripts/llama_agent_client.py --model qwen3-coder:30b "Write a one-line Python fizzbuzz"
+python3 scripts/llama_agent_client.py --model qwen3.8:27b "Write a one-line Python fizzbuzz"
 ```
 
 It hits `POST /v1/chat/completions` against `http://127.0.0.1:8080/v1`, sends the sentinel `api_key` (`local`), and prints the assistant message. If you only need a raw check that the router + model are answering:
 
 ```bash
 curl -s http://127.0.0.1:8080/v1/chat/completions \
-  -H 'Content-Type: application/json' -H 'Authorization: Bearer local' \
-  -d '{"model":"qwen3.8:27b","messages":[{"role":"user","content":"Reply with exactly one word: OK"}]}'
+  -H 'Content-Type: application/json' -H 'Authorization: Bearer ***' \
+  -d '{"model":"qwen3-coder:30b","messages":[{"role":"user","content":"Reply with exactly one word: OK"}]}'
 ```
 
 **Expected outcome.** `OK` on stdout, exit 0. If it errors with a connection refused, the router is down (see [Troubleshooting](#troubleshooting)); if it errors with a 404 model, the name is not registered in `llama-swap.yaml`.
@@ -577,4 +578,17 @@ The reference host has already been through this — its GGUFs are in `~/Dev/llm
 - **llama-swap** — the OpenAI-compatible router with TTL-based model swapping that this deployment runs. <https://github.com/mostlygeek/llama-swap> (verify the canonical repo URL before depending on it — the local install is `v265`, `llama-swap --version`)
 - **Hermes Agent** — the agent runtime, CLI, and the docs behind this guide. <https://hermes-agent.nousresearch.com/docs>
 - **Local reference (the authoritative source for this file):** `~/.hermes/config.yaml`, `~/Dev/llm/llama-swap.yaml`, `~/.config/systemd/user/llama-swap.service`, `~/.hermes/skills/custom/` — this README documents those, not the other way around.
+
+---
+
+## Client access
+
+### Hermes dashboard
+- `ssh -L 8000:localhost:9119 admin@192.168.1.ip`
+- `hermes dashboard`
+- then visit `localhost:8000`
+
+### llama-swap dashboard
+- `ssh -L 8080:localhost:8080 admin@192.168.1.ip`
+- then visit `localhost:8080/ui/`
 
