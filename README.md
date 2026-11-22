@@ -579,3 +579,16 @@ The reference host has already been through this — its GGUFs are in `~/Dev/llm
 - **Hermes Agent** — the agent runtime, CLI, and the docs behind this guide. <https://hermes-agent.nousresearch.com/docs>
 - **Local reference (the authoritative source for this file):** `~/.hermes/config.yaml`, `~/Dev/llm/llama-swap.yaml`, `~/.config/systemd/user/llama-swap.service`, `~/.hermes/skills/custom/` — this README documents those, not the other way around.
 
+---
+
+## Client access
+
+### Hermes dashboard
+- `ssh -L 8000:localhost:9119 admin@192.168.1.ip`
+- `hermes dashboard`
+- then visit `localhost:8000`
+
+### llama-swap dashboard
+- `ssh -L 8080:localhost:8080 admin@192.168.1.ip`
+- then visit `localhost:8080/ui/`
+
