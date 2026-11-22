@@ -65,9 +65,9 @@ These are the values from the system this guide reproduces. Treat them as the *f
 | RAM | 46 GiB |
 | Storage | NVMe, 1.3 TiB total, ~575 GiB free at the reference point in time |
 | GPU | AMD Radeon RX 7900 class (Navi 31) + an AMD Granite Ridge iGPU on-chip |
-| Runtime 1 | llama.cpp `llama-server` (0.6.0-dev, build 11429), one process per model, all layers on GPU |
-| Runtime 2 | llama-swap v265 (model router), listening on `127.0.0.1:8080` |
-| Runtime 3 | Hermes Agent v0.22.2 (Python 3.14) |
+| Runtime 1 | llama.cpp `llama-server` (v1.0.0-dev, build 12359), one process per model, all layers on GPU |
+| Runtime 2 | llama-swap v275 (model router), listening on `127.0.0.1:8080` |
+| Runtime 3 | Hermes Agent v0.23.3 (Python 3.14) |
 | Models in use | `qwen3.8:27b` (default, 16.8 GiB GGUF), `qwen3-coder:30b` (delegation, 18.6 GiB GGUF) |
 | Context | 65 536 tokens per model, q8_0 KV cache, flash attention |
 | Timezone | `Europe/Paris` |
